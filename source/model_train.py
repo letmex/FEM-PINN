@@ -298,15 +298,58 @@ def _load_field_state(field_csv, device):
     }
 
 
-def _find_latest_step(field_path):
-    latest_step = -1
-    for field_file in field_path.glob("field_step_*.csv"):
-        try:
-            step = int(field_file.stem.split("_")[-1])
-        except ValueError:
+def _parse_step_index(value):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_valid_field_csv(field_csv):
+    field_csv = Path(field_csv)
+    if (not field_csv.exists()) or (field_csv.stat().st_size <= 0):
+        return False
+    try:
+        data = np.genfromtxt(field_csv, delimiter=",", names=True, max_rows=1)
+    except Exception:
+        return False
+    if data is None:
+        return False
+    names = tuple(data.dtype.names or ())
+    required = ("x", "y", "T", "ux", "uy", "d", "HI", "HII", "He")
+    return all(name in names for name in required)
+
+
+def _scan_completed_steps(loss_per_step_file, field_path, trainedModel_path, require_checkpoint=True):
+    loss_steps = set()
+    for row in _read_dict_rows(loss_per_step_file):
+        step = _parse_step_index(row.get("step"))
+        if step is None or step < 1:
             continue
-        latest_step = max(latest_step, step)
-    return latest_step
+        loss_steps.add(step)
+
+    completed_steps = set()
+    partial_steps = set()
+    for step in sorted(loss_steps):
+        field_csv = Path(field_path) / Path(f"field_step_{step:04d}.csv")
+        ckpt_file = Path(trainedModel_path) / Path(f"trained_unified_{step:04d}.pt")
+        ok_field = _is_valid_field_csv(field_csv)
+        ok_ckpt = (not require_checkpoint) or (ckpt_file.exists() and ckpt_file.stat().st_size > 0)
+        if ok_field and ok_ckpt:
+            completed_steps.add(step)
+        else:
+            partial_steps.add(step)
+
+    last_completed_step = 0
+    while (last_completed_step + 1) in completed_steps:
+        last_completed_step += 1
+
+    return {
+        "last_completed_step": int(last_completed_step),
+        "completed_steps": sorted(completed_steps),
+        "partial_steps": sorted(partial_steps),
+        "loss_steps": sorted(loss_steps),
+    }
 
 
 def _relative_change(curr, prev, eps=1e-12, floor=1e-8):
@@ -540,6 +583,7 @@ def train_tm(
     results_path,
     writer,
     boundary_tag_dict=None,
+    return_run_meta=False,
 ):
     """
     Monolithic-net thermo-mechanical mixed-mode phase-field training.
@@ -645,11 +689,27 @@ def train_tm(
     physics_rows = []
     trace_iter = 0
     start_step = 1
+    target_final_step = len(time_arr) - 1
+    require_resume_ckpt = bool(training_dict.get("resume_require_checkpoint", True))
+    progress_before = _scan_completed_steps(
+        loss_per_step_file=loss_per_step_file,
+        field_path=field_path,
+        trainedModel_path=trainedModel_path,
+        require_checkpoint=require_resume_ckpt,
+    )
+    steps_before = int(progress_before["last_completed_step"])
+    if len(progress_before.get("partial_steps", [])) > 0:
+        print(
+            "Detected partial/stale trailing steps:",
+            progress_before.get("partial_steps", []),
+            f"(resume baseline step={steps_before})",
+        )
+    train_executed = False
 
     resume_enabled = training_dict.get("resume_if_available", False)
     if resume_enabled:
-        latest_step = _find_latest_step(field_path)
-        if latest_step >= 0:
+        latest_step = int(progress_before["last_completed_step"])
+        if latest_step >= 1:
             ckpt = trainedModel_path / Path(f"trained_unified_{latest_step:04d}.pt")
             field_csv = field_path / Path(f"field_step_{latest_step:04d}.csv")
             if ckpt.exists() and field_csv.exists():
@@ -728,6 +788,17 @@ def train_tm(
 
     if start_step >= len(time_arr):
         print("All time steps are already available. Skipping training.")
+        run_meta = {
+            "train_executed": False,
+            "steps_before": steps_before,
+            "steps_after": steps_before,
+            "new_steps_generated": 0,
+            "eligible_for_escalation": False,
+            "target_final_step": target_final_step,
+            "partial_steps": progress_before.get("partial_steps", []),
+        }
+        if return_run_meta:
+            return inp, T_conn, area_T, bc_dict, run_meta
         return inp, T_conn, area_T, bc_dict
 
     tol_loss = training_dict.get("tol_loss", 1e-4)
@@ -770,6 +841,7 @@ def train_tm(
     branch_weight_state = {"thermal": None, "mechanical": None, "phase": None}
 
     for step_idx in range(start_step, len(time_arr)):
+        train_executed = True
         t_now = torch.tensor(time_arr[step_idx], device=device)
         dt_now = torch.tensor(time_arr[step_idx] - time_arr[step_idx - 1], device=device)
         field_comp.set_time(t_now)
@@ -1556,4 +1628,33 @@ def train_tm(
             HII_prev_nodes = HII_curr.detach()
             He_prev_nodes = He_out.detach()
 
+    progress_after = _scan_completed_steps(
+        loss_per_step_file=loss_per_step_file,
+        field_path=field_path,
+        trainedModel_path=trainedModel_path,
+        require_checkpoint=require_resume_ckpt,
+    )
+    steps_after = int(progress_after["last_completed_step"])
+    new_steps_generated = max(0, steps_after - steps_before)
+    run_meta = {
+        "train_executed": bool(train_executed),
+        "steps_before": steps_before,
+        "steps_after": steps_after,
+        "new_steps_generated": int(new_steps_generated),
+        "eligible_for_escalation": bool(train_executed and (new_steps_generated > 0)),
+        "target_final_step": target_final_step,
+        "partial_steps_before": progress_before.get("partial_steps", []),
+        "partial_steps_after": progress_after.get("partial_steps", []),
+    }
+    if return_run_meta:
+        return inp, T_conn, area_T, bc_dict, run_meta
     return inp, T_conn, area_T, bc_dict
+
+
+# -----------------------------------------------------------------------------
+# Stateful orchestrated TM-phase training is the default main path.
+# Keep the legacy implementation above for audit/backward reference only.
+# -----------------------------------------------------------------------------
+from model_train_stateful import train_tm as _train_tm_stateful
+
+train_tm = _train_tm_stateful

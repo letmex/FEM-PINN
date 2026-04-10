@@ -104,6 +104,8 @@ training_dict = {
     "adaptive_lbfgs_mult": 1,
     "adaptive_rprop_mult": 1,
     "resume_if_available": True,
+    # Resume only from steps with complete loss/field/checkpoint triplets.
+    "resume_require_checkpoint": True,
     "max_inner_iters": 12,
     "conv_patience": 1,
     "tol_loss": 8e-1,

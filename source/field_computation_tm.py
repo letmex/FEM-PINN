@@ -174,6 +174,13 @@ class MonolithicTMPhaseFieldComputation:
             return torch.unique(torch.cat((patch, fixed_point_nodes)))
         return fixed_point_nodes
 
+    def build_anchor_patch_nodes(self, inp, mechanical_bottom_nodes, fixed_point_nodes):
+        """
+        Public helper used by training orchestrators to build a tiny gauge patch
+        around the fixed point for roller-mode rigid-body removal.
+        """
+        return self._build_anchor_patch_nodes(inp, mechanical_bottom_nodes, fixed_point_nodes)
+
     def map_temperature(self, T_raw, thermal_dirichlet_nodes=None, T_bc_value=None):
         # Sukumar-style hard Dirichlet ansatz:
         # T = G_T + Phi_T * T_tilde, with Phi_T|Gamma_D = 0 and G_T|Gamma_D = T_bc.

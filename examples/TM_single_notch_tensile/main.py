@@ -42,7 +42,7 @@ def _read_physical_report(report_file):
 
 def _run_once_with_current_config():
     try:
-        inp_, T_conn_, area_T_, bc_dict_ = train_tm(
+        inp_, T_conn_, area_T_, bc_dict_, run_meta_ = train_tm(
             field_comp=field_comp,
             thermo_model=thermo_model,
             thermal_prop=thermal_prop,
@@ -57,10 +57,11 @@ def _run_once_with_current_config():
             results_path=results_path,
             writer=writer,
             boundary_tag_dict=boundary_tag_dict,
+            return_run_meta=True,
         )
     except RuntimeError as e:
         print(f"[auto-physics] run failed: {e}")
-        return None, None, None, None, False, str(e)
+        return None, None, None, None, False, str(e), {}
 
     postprocess_tm(
         results_path=results_path,
@@ -71,7 +72,7 @@ def _run_once_with_current_config():
         bc_dict=bc_dict_,
     )
 
-    return inp_, T_conn_, area_T_, bc_dict_, True, ""
+    return inp_, T_conn_, area_T_, bc_dict_, True, "", run_meta_
 
 
 # run as:
@@ -115,9 +116,18 @@ if __name__ == "__main__":
     inp = T_conn = area_T = bc_dict = None
     for round_idx in range(1, max_rounds + 1):
         print(f"[auto-physics] round {round_idx}/{max_rounds} start")
-        inp, T_conn, area_T, bc_dict, run_ok, fail_msg = _run_once_with_current_config()
+        inp, T_conn, area_T, bc_dict, run_ok, fail_msg, run_meta = _run_once_with_current_config()
 
         report = _read_physical_report(results_path / Path("losses/physical_correctness_report.txt"))
+        train_executed = bool(run_meta.get("train_executed", False))
+        steps_before = int(run_meta.get("steps_before", 0))
+        steps_after = int(run_meta.get("steps_after", steps_before))
+        new_steps_generated = int(run_meta.get("new_steps_generated", 0))
+        eligible_for_escalation = bool(
+            run_meta.get("eligible_for_escalation", train_executed and (new_steps_generated > 0))
+        )
+        target_final_step = int(run_meta.get("target_final_step", -1))
+        already_complete = (target_final_step >= 0) and (steps_after >= target_final_step)
         passed = run_ok and (int(report.get("overall_pass", "0")) == 1)
 
         _append_timeline_row(
@@ -135,11 +145,29 @@ if __name__ == "__main__":
                 "phase_balance_target_ratio": float(training_dict.get("phase_balance_target_ratio", 0.2)),
                 "phase_rprop": int(optimizer_dict.get("n_epochs_RPROP_phase", 120)),
                 "w_irrev": float(training_dict.get("w_irrev", 1.0)),
+                "train_executed": int(train_executed),
+                "steps_before": int(steps_before),
+                "steps_after": int(steps_after),
+                "new_steps_generated": int(new_steps_generated),
+                "eligible_for_escalation": int(eligible_for_escalation),
             },
         )
 
         if passed:
             print(f"[auto-physics] pass at round {round_idx}")
+            break
+
+        if (not eligible_for_escalation) or already_complete:
+            if already_complete:
+                print(
+                    "[auto-physics] target steps already completed; "
+                    "no training executed in this round, escalation disabled."
+                )
+            else:
+                print(
+                    "[auto-physics] no new trained steps generated in this round; "
+                    "escalation disabled."
+                )
             break
 
         if (not run_ok) and ("convergence criteria not met" in str(fail_msg)):
@@ -166,8 +194,18 @@ if __name__ == "__main__":
                 f"tol_hist {old_tol_hist:.4g}->{training_dict['tol_hist']:.4g}"
             )
 
-            inp, T_conn, area_T, bc_dict, run_ok_relaxed, fail_msg_relaxed = _run_once_with_current_config()
+            inp, T_conn, area_T, bc_dict, run_ok_relaxed, fail_msg_relaxed, run_meta_relaxed = _run_once_with_current_config()
             report_relaxed = _read_physical_report(results_path / Path("losses/physical_correctness_report.txt"))
+            train_executed_relaxed = bool(run_meta_relaxed.get("train_executed", False))
+            steps_before_relaxed = int(run_meta_relaxed.get("steps_before", 0))
+            steps_after_relaxed = int(run_meta_relaxed.get("steps_after", steps_before_relaxed))
+            new_steps_relaxed = int(run_meta_relaxed.get("new_steps_generated", 0))
+            eligible_relaxed = bool(
+                run_meta_relaxed.get(
+                    "eligible_for_escalation",
+                    train_executed_relaxed and (new_steps_relaxed > 0),
+                )
+            )
             passed_relaxed = run_ok_relaxed and (int(report_relaxed.get("overall_pass", "0")) == 1)
 
             _append_timeline_row(
@@ -185,11 +223,23 @@ if __name__ == "__main__":
                     "phase_balance_target_ratio": float(training_dict.get("phase_balance_target_ratio", 0.2)),
                     "phase_rprop": int(optimizer_dict.get("n_epochs_RPROP_phase", 120)),
                     "w_irrev": float(training_dict.get("w_irrev", 1.0)),
+                    "train_executed": int(train_executed_relaxed),
+                    "steps_before": int(steps_before_relaxed),
+                    "steps_after": int(steps_after_relaxed),
+                    "new_steps_generated": int(new_steps_relaxed),
+                    "eligible_for_escalation": int(eligible_relaxed),
                 },
             )
 
             if passed_relaxed:
                 print(f"[auto-physics] pass at round {round_idx} (relaxed)")
+                break
+
+            if not eligible_relaxed:
+                print(
+                    "[auto-physics] relaxed retry produced no new trained steps; "
+                    "escalation disabled."
+                )
                 break
 
         if not auto_loop:
